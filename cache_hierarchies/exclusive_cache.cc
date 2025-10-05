@@ -26,10 +26,17 @@ ostream& operator<<(ostream& os, const PACKET &packet)
 void CACHE::handle_fill()
 {
     // handle fill
+
+    // core for which the next fill is scheduled
     uint32_t fill_cpu = (MSHR.next_fill_index == MSHR_SIZE) ? NUM_CPUS : MSHR.entry[MSHR.next_fill_index].cpu;
     if (fill_cpu == NUM_CPUS)
         return;
 
+    
+
+    // Each MSHR entry has a scheduled fill cycle (when data will arrive).
+    // Only process it if the current cycle has reached that time.
+    
     if (MSHR.next_fill_cycle <= current_core_cycle[fill_cpu]) {
 
 #ifdef SANITY_CHECK
@@ -39,43 +46,55 @@ void CACHE::handle_fill()
 
         uint32_t mshr_index = MSHR.next_fill_index;
 
-        // find victim
+        // find victim, which cache set where the data should be placed using the address from the MSHR entry
         uint32_t set = get_set(MSHR.entry[mshr_index].address), way;
-        way = (this->*find_victim)(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
 
+        // Cache replacement policy, Chooses which cache line (way) to evict from the given set
+        way = (this->*find_victim)(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
 
         //Neelu: Fill Packet type for L2
         uint8_t fill_packet_type = 0; //1.Translation 2. Instruction 3. Data
 
+        // Used later for L2 conflict statistics, only for fill types of L2
         if(cache_type == IS_L2C)
         {
             if(MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION || MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D || MSHR.entry[mshr_index].type == LOAD_TRANSLATION)
-                fill_packet_type = 1;
+                fill_packet_type = 1; // translation
             else if((MSHR.entry[mshr_index].type == LOAD || MSHR.entry[mshr_index].type == PREFETCH) && MSHR.entry[mshr_index].instruction)
-                fill_packet_type = 2;
+                fill_packet_type = 2; // instruction
             else
-                fill_packet_type = 3;
+                fill_packet_type = 3; // data
         }
 
-
-        uint8_t  do_fill = 1;
+        uint8_t  do_fill = 1; // insert in cache? 1: yes, 0: no
 
         //Prefetch translation requests should be dropped in case of page fault
+        // ign 
+
+        // When a prefetch request should be dropped (not filled into the cache). This usually happens if the data returned is invalid or signals a page fault
+
         if(cache_type == IS_ITLB || cache_type == IS_DTLB || cache_type == IS_STLB)
         {
             if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D)
                 assert(0);
+            
+            // Indicates an invalid translation (page fault)
             if(MSHR.entry[mshr_index].data == (UINT64_MAX >> LOG2_PAGE_SIZE))
             {
                 do_fill = 0;	//Drop the prefetch packet
 
                 // COLLECT STATS
+                // fill is invalid
                 if (MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D || MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION )
                 {
                     pf_dropped++;
                     //@Vasudha: if merged with prefetch_request from upper level
                     if(cache_type == IS_STLB && MSHR.entry[mshr_index].fill_level == 1)
-                    {
+                    {   
+                        // If the cache is an STLB (Shared TLB) and the request was merged with an upper-level prefetch, the code may need to notify both the instruction and data caches at the upper level that the request was dropped. This is done by calling return_data() on the appropriate upper-level cache(s).
+
+
+                        // Returns data to upper level if request was merged
                         if(MSHR.entry[mshr_index].send_both_tlb)
                         {
                             upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
@@ -91,6 +110,8 @@ void CACHE::handle_fill()
                     //Add to procesed queue to notify L1D about dropped request due to page fault
                     if(cache_type == IS_STLB && MSHR.entry[mshr_index].l1_pq_index != -1 && MSHR.entry[mshr_index].fill_l1d != -1) //@Vishal: Prefetech request from L1D prefetcher
                     {
+                        // If the request originated from the L1D prefetcher and needs to notify L1D about the dropped request, a temporary packet is created and added to the PROCESSED queue. This ensures the L1D knows the prefetch was dropped due to a page fault.
+
                         assert(MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D);
                         PACKET temp = MSHR.entry[mshr_index];
                         temp.data_pa = MSHR.entry[mshr_index].data;
@@ -104,6 +125,8 @@ void CACHE::handle_fill()
                     }
                     else if(cache_type == IS_STLB && MSHR.entry[mshr_index].prefetch_translation_merged && MSHR.entry[mshr_index].fill_l1d!= -1)//@Vishal: Prefetech request from L1D prefetcher
                     {
+                        // 
+
                         assert(MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D);
                         PACKET temp = MSHR.entry[mshr_index];
                         temp.data_pa = MSHR.entry[mshr_index].data;
@@ -127,6 +150,7 @@ void CACHE::handle_fill()
                         else
                             assert(0);
                     }
+                    // Removes the MSHR entry and returns.
                     MSHR.remove_queue(&MSHR.entry[mshr_index]);
                     MSHR.num_returned--;
                     update_fill_cycle();
@@ -144,11 +168,19 @@ void CACHE::handle_fill()
                     //ooo_cpu[fill_cpu].DTLB.add_rq(&MSHR.entry[mshr_index]);
                     //MSHR.remove_queue(&MSHR.entry[mshr_index]);
                     //MSHR.num_returned--;
+
+
+                    // If the dropped prefetch is not a translation, but was merged with a demand request, the code marks the MSHR entry as in-flight and forwards it to the lower level (e.g., PTW or DTLB). This ensures that the demand request is still serviced, even though the prefetch was dropped.
+
                     MSHR.entry[mshr_index].returned = INFLIGHT;
+                    
                     if(lower_level)
                         lower_level->add_rq(&MSHR.entry[mshr_index]);
+                    
                     update_fill_cycle();
+                    
                     return;
+                    
                     //}
                     /*else	//PREFETCH merged with LOAD/RFO
                       {
@@ -165,6 +197,7 @@ void CACHE::handle_fill()
 
 
             }
+        
         }
 
         //Neelu: Calculating Instruction and Data Conflicts in L2C
@@ -193,7 +226,6 @@ void CACHE::handle_fill()
                 assert(0);	//What else could there be? No other case, right? 
 
         }
-
 
 
         // is this dirty?
@@ -238,50 +270,69 @@ void CACHE::handle_fill()
 #endif
         }
 
+        // 
         if (do_fill){
 
             //@Vasudha: For PC-offset DTLB prefetcher, in case of eviction, transfer block from training table to trained table
+
+            // Block is valid
             if(cache_type == IS_DTLB && block[set][way].valid==1)
             {
+                // Prefetcher learn which address translations are being used and which are being evicted, improving future TLB prefetches
+
                 dtlb_prefetcher_cache_fill(MSHR.entry[mshr_index].full_addr, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0, block[set][way].address<<LOG2_PAGE_SIZE, 
                         MSHR.entry[mshr_index].pf_metadata);
             }
             // update prefetcher
             if (cache_type == IS_L1I)
+
+                // The L1I prefetcher is updated with the instruction address that was filled, the set/way, and whether it was a prefetch. This helps the prefetcher learn instruction access patterns.
+
                 l1i_prefetcher_cache_fill(fill_cpu, ((MSHR.entry[mshr_index].ip)>>LOG2_BLOCK_SIZE)<<LOG2_BLOCK_SIZE, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0, ((block[set][way].ip)>>LOG2_BLOCK_SIZE)<<LOG2_BLOCK_SIZE);
             if (cache_type == IS_L1D)
             {
                 uint64_t v_fill_addr, v_evicted_addr;
+                
+                // PA to VA 
+                // L1D prefetcher is updated with the virtual address of the fill and the evicted block
                 map <uint64_t, uint64_t>::iterator ppage_check = inverse_table.find(MSHR.entry[mshr_index].full_addr >> LOG2_PAGE_SIZE);
+                
                 if(ppage_check == inverse_table.end())
                 {
+                    // If the evicted address isn't in the table, it's set to zero (not all evictions are of valid blocks).
+
                     cout << MSHR.entry[mshr_index];
                     assert(0);
                 }
+
+                // get the fill address
                 v_fill_addr = (ppage_check->second) << LOG2_PAGE_SIZE;
                 v_fill_addr |= (MSHR.entry[mshr_index].full_addr & ((1 << LOG2_PAGE_SIZE)-1));
 
                 //Now getting virtual address for the evicted address
                 /*Neelu: Note that it is not always necessary that evicted address is a valid address and is present in the inverse table, hence (1) do not use the assert and (2) if it is not present, assign it to zero. */
 
-
                 ppage_check = inverse_table.find(block[set][way].address >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE));
                 if(ppage_check != inverse_table.end())
                 {
+                    // evicted address 
                     v_evicted_addr = (ppage_check->second) << LOG2_PAGE_SIZE;
                     v_evicted_addr |= ((block[set][way].address << LOG2_BLOCK_SIZE) & ((1 << LOG2_PAGE_SIZE)-1));
                 }
                 else
                     v_evicted_addr = 0;
 
+                
                 l1d_prefetcher_cache_fill(v_fill_addr, MSHR.entry[mshr_index].full_addr, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0, v_evicted_addr, block[set][way].address<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].pf_metadata);
 
             }
             if  (cache_type == IS_L2C)
+                // L2 prefetchers are updated with the fill and eviction addresses
                 MSHR.entry[mshr_index].pf_metadata = l2c_prefetcher_cache_fill(MSHR.entry[mshr_index].address<<LOG2_BLOCK_SIZE, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0,
                         block[set][way].address<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].pf_metadata);
             if (cache_type == IS_LLC)
             {
+                // LLC prefetchers are updated with the fill and eviction addresses
                 cpu = fill_cpu;
                 MSHR.entry[mshr_index].pf_metadata = llc_prefetcher_cache_fill(MSHR.entry[mshr_index].address<<LOG2_BLOCK_SIZE, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0,
                         block[set][way].address<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].pf_metadata);
@@ -289,12 +340,15 @@ void CACHE::handle_fill()
             }
 
 
-            // update replacement policy
+            // cache's replacement policy (e.g., LRU or a custom policy) is updated with information about the fill and eviction
             (this->*update_replacement_state)(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0);
 
             // COLLECT STATS
+            // counter of mshr misses
             sim_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
+
             //Neelu: Capturing instruction stats for L2C
+            
             if((cache_type == IS_L2C) && (MSHR.entry[mshr_index].instruction == 1))
                 sim_instr_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
             sim_access[fill_cpu][MSHR.entry[mshr_index].type]++;
@@ -316,31 +370,81 @@ void CACHE::handle_fill()
 #ifdef PUSH_DTLB_PB
             if ( (cache_type!=IS_DTLB) || (cache_type==IS_DTLB && MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION) )
 #endif	
-                fill_cache(set, way, &MSHR.entry[mshr_index]);
+            
+
+        // Need to check the address is present in lower level, if yes, then invalidate it
+            TODO:
+
+            if (cache_type == IS_L1D || cache_type == IS_L1I){
+                uint64_t L1_missed_address = MSHR.entry[mshr_index].address;
+                ooo_cpu[0].L2C.invalidate_entry(L1_missed_address);
+                
+                // ooo_cpu[0].L2C.MSHR.remove_queue(&ooo_cpu[0].L2C.MSHR.entry[mshr_index]);
+                // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
+
+                uncore.LLC.invalidate_entry(L1_missed_address);
+
+                fill_cache(set, way, &MSHR.entry[mshr_index]);                       
+            }
+
+            if (cache_type == IS_L2C) {
+                uint64_t L2_missed_address = MSHR.entry[mshr_index].address;
+
+                uncore.LLC.invalidate_entry(L2_missed_address);
+                // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
+
+                if (MSHR.entry[mshr_index].fill_level == FILL_L2) {
+                    fill_cache(set, way, &MSHR.entry[mshr_index]);
+                }
+            }
+
+            if (cache_type == IS_LLC) {
+                // No need to check with DRAM
+                uint64_t LLC_missed_address = MSHR.entry[mshr_index].address;
+
+                if (MSHR.entry[mshr_index].fill_level == FILL_L1 || MSHR.entry[mshr_index].fill_level == FILL_L2) {
+                    // No need to fill_cache here, as the data will be filled in L1 or L2 cache
+
+                } else {
+                    fill_cache(set, way, &MSHR.entry[mshr_index]);
+                }
+
+                // No need to invalidate as the filled block will be there in LLC only.
+            }
+
+
 #ifdef PUSH_DTLB_PB
             else if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION)
             {
+                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0);
                 uint32_t victim_way;
                 victim_way = ooo_cpu[fill_cpu].DTLB_PB.find_victim( fill_cpu, MSHR.entry[mshr_index].instr_id, 0, ooo_cpu[fill_cpu].DTLB_PB.block[0] , MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
-                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0);
                 ooo_cpu[fill_cpu].DTLB_PB.fill_cache( 0, victim_way, &MSHR.entry[mshr_index] );
             }
 #endif
             // RFO marks cache line dirty
             if (cache_type == IS_L1D) {
+                // If the fill is a Read For Ownership (RFO) (typically a store miss), the filled cache line is marked dirty, since the CPU intends to write to it.
+
                 if (MSHR.entry[mshr_index].type == RFO)
                     block[set][way].dirty = 1;
             }
 
             //Neelu: Adding condition to ensure that STLB does not insert instruction translations to Processed queue.
+
+            // Either the request should notify both instruction and data TLBs, or it's a data (not instruction) request and associated with L1 prefetch queue entry
+
             if(cache_type == IS_STLB && MSHR.entry[mshr_index].l1_pq_index != -1 && (MSHR.entry[mshr_index].send_both_tlb or !MSHR.entry[mshr_index].instruction)) //@Vishal: Prefetech request from L1D prefetcher
             {
 
                 PACKET temp = MSHR.entry[mshr_index];
-                temp.data_pa = block[set][way].data;
+                temp.data_pa = block[set][way].data; // physical address
                 assert(temp.l1_rq_index == -1 && temp.l1_wq_index == -1);
                 temp.read_translation_merged = 0; //@Vishal: Remove this before adding to PQ
                 temp.write_translation_merged = 0;
+
+                // This queue is used to notify the L1D (or other upper-level caches) that the translation prefetch has completed and the result is available.
+
                 if (PROCESSED.occupancy < PROCESSED.SIZE)
                     PROCESSED.add_queue(&temp);
                 else
@@ -348,6 +452,8 @@ void CACHE::handle_fill()
             }
             else if(cache_type == IS_STLB && MSHR.entry[mshr_index].prefetch_translation_merged) //@Vishal: Prefetech request from L1D prefetcher
             {
+                // Prefetch translation request from the L1D prefetcher was merged with another translation request in the STLB. When the translation is ready (i.e., the page table walk is complete and the translation is filled into the STLB), the code prepares a notification packet and adds it to the PROCESSED queue.
+
                 PACKET temp = MSHR.entry[mshr_index];
                 temp.data_pa = block[set][way].data;
                 temp.read_translation_merged = 0; //@Vishal: Remove this before adding to PQ
@@ -359,6 +465,10 @@ void CACHE::handle_fill()
             }
 
             //Neelu: Invoking the L2C prefetcher on STLB fills
+
+// When a translation request completes in the shared TLB (STLB), and it originated from a data (not instruction) request in L1D (instruction == 0), the code sends a "hint" to the L2 cache prefetcher.
+
+// This hint is a physical address, constructed from the translation result and the original request's virtual address, and is marked with a special type (6) so the L2 prefetcher can differentiate it from regular prefetches.
 
 #ifdef STLB_HINT_TO_L2_PREF
             if(cache_type == IS_STLB)
@@ -372,7 +482,8 @@ void CACHE::handle_fill()
                             cout << "[" << NAME << "] " << __func__ << "sending stlb hint to L2: "; 
                             cout << " phy_addr: " << hex << phy_addr;
                             cout << " ip: " << MSHR.entry[mshr_index].ip << endl; });
-
+                    
+                    // send hint to L2 prefetcher
                     uint32_t temp_metadata = ooo_cpu[fill_cpu].L2C.l2c_prefetcher_operate(phy_addr<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].ip, 0, 6, 0);
                     float l2c_mpki; // = (ooo_cpu[fill_cpu].L2C.sim_access[fill_cpu][0]*1000)/(ooo_cpu[fill_cpu].num_retired);
                     if(warmup_complete[fill_cpu])
@@ -383,14 +494,14 @@ void CACHE::handle_fill()
                                 l2c_mpki = (ooo_cpu[fill_cpu].L2C.sim_miss[fill_cpu][0]*1000)/(ooo_cpu[fill_cpu].num_retired);
                     /*			if((((temp_metadata >> 17) & 1) | ((temp_metadata >> 18) & 1)) == 1)
                                 getting_hint_from_l2++;*/
+                    // send hint to LLC prefetcher
                     uncore.LLC.llc_prefetcher_operate(phy_addr<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].ip, 0, 6, temp_metadata);
-
                 }
             }
 #endif
 
 
-            //Neelu: Pushing Prefetches from L2 to L1 after they fill in L2.
+//Neelu: Pushing Prefetches from L2 to L1 after they fill in L2.
 #ifdef PUSH_PREFETCHES_FROM_L2_TO_L1
             if((cache_type == IS_L2C) && (MSHR.entry[mshr_index].type == PREFETCH) && (MSHR.entry[mshr_index].fill_level == FILL_L2))
             {
@@ -398,17 +509,22 @@ void CACHE::handle_fill()
                 //uint32_t updated_metadata = MSHR.entry[mshr_index].pf_metadata | (1 << 16);	
                 //Neelu: Commenting this, because now, this bit will be set by the L2C prefetcher in the cache_fill function.
                 //Hence, argument passed will directly be MSHR packet's metadata instead of updated_metadata if the bit is set.
+                
+                // Pushes the prefetched line from L2 up to L1D.
                 if(((MSHR.entry[mshr_index].pf_metadata >> 16) & 1) == 1)
+                
                     ooo_cpu[fill_cpu].L1D.prefetch_line(MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].full_addr, FILL_L1, MSHR.entry[mshr_index].pf_metadata);
             }
 
 #endif	
 
             // check fill level
+            // Fill happening at lower level, if a request was sent from L1D to L2, and the fill is now happening in L2
             if (MSHR.entry[mshr_index].fill_level < fill_level) {
 
                 if(cache_type == IS_STLB)
                 {
+                    // If the fill is in the STLB, the code checks if the request should notify both the instruction and data TLBs (send_both_tlb), or just one 
                     MSHR.entry[mshr_index].prefetch_translation_merged = 0;
 
                     if(MSHR.entry[mshr_index].send_both_tlb)
@@ -422,12 +538,16 @@ void CACHE::handle_fill()
                         upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                 }
                 else if(cache_type == IS_L2C && (MSHR.entry[mshr_index].type == LOAD_TRANSLATION || MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION || MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D))
-                {
-                    extra_interface->return_data(&MSHR.entry[mshr_index]);
+                {   
+                    // Translation need to be copied
 
+                    // calls return_data() on an extra_interface (TLB) to deliver the translation result.
+                    extra_interface->return_data(&MSHR.entry[mshr_index]);
                 }
+
                 else if(cache_type == IS_L2C)
                 {
+                    // For L2C
                     if(MSHR.entry[mshr_index].send_both_cache)
                     {
                         upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
@@ -447,6 +567,7 @@ void CACHE::handle_fill()
                 }
                 else
                 {
+                    // Other cases
                     if (MSHR.entry[mshr_index].instruction) 
                         upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                     else // data
@@ -455,6 +576,8 @@ void CACHE::handle_fill()
             }
             //@v if send_both_tlb == 1 in STLB, response should return to both ITLB and DTLB
 
+            // Which completed requests should be added to the PROCESSED queue.
+            // fill is in ...
 
             // update processed packets
             if ((cache_type == IS_ITLB) && (MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION)) { //@v Responses to prefetch requests should not go to PROCESSED queue 
@@ -485,7 +608,10 @@ void CACHE::handle_fill()
                 total_miss_latency += current_miss_latency;
             }
 
+            // completed request is removed from the MSHR
             MSHR.remove_queue(&MSHR.entry[mshr_index]);
+
+            // Number of requests serviced, decrement the count
             MSHR.num_returned--;
 
             update_fill_cycle();
