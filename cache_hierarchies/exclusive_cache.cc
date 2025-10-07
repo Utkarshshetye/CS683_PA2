@@ -227,8 +227,7 @@ void CACHE::handle_fill()
 
                     block[set][way].valid = 0; // current line become invalid
                     block[set][way].dirty = 0; // current line is no longer dirty, as dirty line is moved to the lower cache
-                    block[set][way].tag = 0;
-                    
+                    // block[set][way].tag = 0;
                 }   
             }
 #ifdef SANITY_CHECK
@@ -529,7 +528,7 @@ void CACHE::handle_fill()
                     else // data
                         upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
 
-                    invalidate_entry(MSHR.entry[mshr_index].confidence);     
+                    invalidate_entry(MSHR.entry[mshr_index].address);     
                 }
             }
             //@v if send_both_tlb == 1 in STLB, response should return to both ITLB and DTLB
@@ -621,6 +620,8 @@ if (writeback_cpu == NUM_CPUS)
         // Address in write queue is already present in the cache set, way is set to the matching way where hit occured
         int way = check_hit(&WQ.entry[index]);
 
+        // This condition will not occur in exclusive cache
+
         if (way >= 0) { // writeback hit (or RFO hit for L1D)
 
             (this->*update_replacement_state)(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1); // Updates the cache state
@@ -648,13 +649,13 @@ if (writeback_cpu == NUM_CPUS)
                     {  // Block is relevent to L1 I cache, return data to the upper level l1i
                         upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
                         // block[set][way].valid = 0; 
-                        invalidate_entry(WQ.entry[index].address);
+                        // invalidate_entry(WQ.entry[index].address);
                     }
                     if(WQ.entry[index].fill_l1d)
                     {   // Same as above but for l1d
                         upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
                         // block[set][way].valid = 0;
-                        invalidate_entry(WQ.entry[index].address);
+                        // invalidate_entry(WQ.entry[index].address);
                     }
                     // data filled by L2 and is sent back to the L1
                 }
@@ -668,7 +669,7 @@ if (writeback_cpu == NUM_CPUS)
                                 upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 
                                 // block[set][way].valid = 0;
-                                invalidate_entry(WQ.entry[index].address);
+                                // invalidate_entry(WQ.entry[index].address);
                             }
                   
                             if (WQ.entry[index].is_data) {
@@ -676,7 +677,7 @@ if (writeback_cpu == NUM_CPUS)
                                 upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 
                                 // block[set][way].valid = 0;
-                                invalidate_entry(WQ.entry[index].address);
+                                // invalidate_entry(WQ.entry[index].address);
                             }
                         }
                     } else {
@@ -952,9 +953,11 @@ if (writeback_cpu == NUM_CPUS)
                                 // upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
 
                                 // invalidate_entry(WQ.entry[index].address);
-                                ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
 
-                                WQ.entry[index].fill_l1i = false;
+                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index]))
+                                    ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
+
+                                WQ.entry[index].fill_l1i = 0;
                             }
                             if(WQ.entry[index].fill_l1d)
                             {
@@ -964,8 +967,10 @@ if (writeback_cpu == NUM_CPUS)
 
                                 // invalidate_entry(WQ.entry[index].address);
 
-                                ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
-                                WQ.entry[index].fill_l1d = false;
+                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index]))
+                                    ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
+
+                                WQ.entry[index].fill_l1d = 0;
                             }
                         }
                         else
@@ -976,6 +981,22 @@ if (writeback_cpu == NUM_CPUS)
                                 //     upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 // if (WQ.entry[index].is_data)
                                 //     upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                
+                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index])) {
+
+                                    ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
+                                }
+                                
+                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index])) {
+
+                                    ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
+                                }
+
+                                if (ooo_cpu[writeback_cpu].L2C.check_hit(&WQ.entry[index])) {
+
+                                    ooo_cpu[writeback_cpu].L2C.invalidate_entry(WQ.entry[index].address);
+                                }
+                                
                             }
 
                             //
@@ -1693,7 +1714,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                             }
                             else
                             {
-
                                 // add it to mshr (read miss)
                                 add_nonfifo_queue(&MSHR, &RQ.entry[index]); //@Vishal: Updated from add_mshr
 
