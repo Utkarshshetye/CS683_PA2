@@ -1,8 +1,5 @@
 //  exclusive
 
-
-
-
 #include "cache.h"
 #include "set.h"
 #include "ooo_cpu.h"
@@ -26,17 +23,10 @@ ostream& operator<<(ostream& os, const PACKET &packet)
 void CACHE::handle_fill()
 {
     // handle fill
-
-    // core for which the next fill is scheduled
     uint32_t fill_cpu = (MSHR.next_fill_index == MSHR_SIZE) ? NUM_CPUS : MSHR.entry[MSHR.next_fill_index].cpu;
     if (fill_cpu == NUM_CPUS)
         return;
 
-    
-
-    // Each MSHR entry has a scheduled fill cycle (when data will arrive).
-    // Only process it if the current cycle has reached that time.
-    
     if (MSHR.next_fill_cycle <= current_core_cycle[fill_cpu]) {
 
 #ifdef SANITY_CHECK
@@ -46,55 +36,43 @@ void CACHE::handle_fill()
 
         uint32_t mshr_index = MSHR.next_fill_index;
 
-        // find victim, which cache set where the data should be placed using the address from the MSHR entry
+        // find victim
         uint32_t set = get_set(MSHR.entry[mshr_index].address), way;
-
-        // Cache replacement policy, Chooses which cache line (way) to evict from the given set
         way = (this->*find_victim)(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
+
 
         //Neelu: Fill Packet type for L2
         uint8_t fill_packet_type = 0; //1.Translation 2. Instruction 3. Data
 
-        // Used later for L2 conflict statistics, only for fill types of L2
         if(cache_type == IS_L2C)
         {
             if(MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION || MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D || MSHR.entry[mshr_index].type == LOAD_TRANSLATION)
-                fill_packet_type = 1; // translation
+                fill_packet_type = 1;
             else if((MSHR.entry[mshr_index].type == LOAD || MSHR.entry[mshr_index].type == PREFETCH) && MSHR.entry[mshr_index].instruction)
-                fill_packet_type = 2; // instruction
+                fill_packet_type = 2;
             else
-                fill_packet_type = 3; // data
+                fill_packet_type = 3;
         }
 
-        uint8_t  do_fill = 1; // insert in cache? 1: yes, 0: no
+
+        uint8_t  do_fill = 1;
 
         //Prefetch translation requests should be dropped in case of page fault
-        // ign 
-
-        // When a prefetch request should be dropped (not filled into the cache). This usually happens if the data returned is invalid or signals a page fault
-
         if(cache_type == IS_ITLB || cache_type == IS_DTLB || cache_type == IS_STLB)
         {
             if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D)
                 assert(0);
-            
-            // Indicates an invalid translation (page fault)
             if(MSHR.entry[mshr_index].data == (UINT64_MAX >> LOG2_PAGE_SIZE))
             {
                 do_fill = 0;	//Drop the prefetch packet
 
                 // COLLECT STATS
-                // fill is invalid
                 if (MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D || MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION )
                 {
                     pf_dropped++;
                     //@Vasudha: if merged with prefetch_request from upper level
                     if(cache_type == IS_STLB && MSHR.entry[mshr_index].fill_level == 1)
-                    {   
-                        // If the cache is an STLB (Shared TLB) and the request was merged with an upper-level prefetch, the code may need to notify both the instruction and data caches at the upper level that the request was dropped. This is done by calling return_data() on the appropriate upper-level cache(s).
-
-
-                        // Returns data to upper level if request was merged
+                    {
                         if(MSHR.entry[mshr_index].send_both_tlb)
                         {
                             upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
@@ -110,8 +88,6 @@ void CACHE::handle_fill()
                     //Add to procesed queue to notify L1D about dropped request due to page fault
                     if(cache_type == IS_STLB && MSHR.entry[mshr_index].l1_pq_index != -1 && MSHR.entry[mshr_index].fill_l1d != -1) //@Vishal: Prefetech request from L1D prefetcher
                     {
-                        // If the request originated from the L1D prefetcher and needs to notify L1D about the dropped request, a temporary packet is created and added to the PROCESSED queue. This ensures the L1D knows the prefetch was dropped due to a page fault.
-
                         assert(MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D);
                         PACKET temp = MSHR.entry[mshr_index];
                         temp.data_pa = MSHR.entry[mshr_index].data;
@@ -125,8 +101,6 @@ void CACHE::handle_fill()
                     }
                     else if(cache_type == IS_STLB && MSHR.entry[mshr_index].prefetch_translation_merged && MSHR.entry[mshr_index].fill_l1d!= -1)//@Vishal: Prefetech request from L1D prefetcher
                     {
-                        // 
-
                         assert(MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D);
                         PACKET temp = MSHR.entry[mshr_index];
                         temp.data_pa = MSHR.entry[mshr_index].data;
@@ -150,7 +124,6 @@ void CACHE::handle_fill()
                         else
                             assert(0);
                     }
-                    // Removes the MSHR entry and returns.
                     MSHR.remove_queue(&MSHR.entry[mshr_index]);
                     MSHR.num_returned--;
                     update_fill_cycle();
@@ -168,19 +141,11 @@ void CACHE::handle_fill()
                     //ooo_cpu[fill_cpu].DTLB.add_rq(&MSHR.entry[mshr_index]);
                     //MSHR.remove_queue(&MSHR.entry[mshr_index]);
                     //MSHR.num_returned--;
-
-
-                    // If the dropped prefetch is not a translation, but was merged with a demand request, the code marks the MSHR entry as in-flight and forwards it to the lower level (e.g., PTW or DTLB). This ensures that the demand request is still serviced, even though the prefetch was dropped.
-
                     MSHR.entry[mshr_index].returned = INFLIGHT;
-                    
                     if(lower_level)
                         lower_level->add_rq(&MSHR.entry[mshr_index]);
-                    
                     update_fill_cycle();
-                    
                     return;
-                    
                     //}
                     /*else	//PREFETCH merged with LOAD/RFO
                       {
@@ -197,7 +162,6 @@ void CACHE::handle_fill()
 
 
             }
-        
         }
 
         //Neelu: Calculating Instruction and Data Conflicts in L2C
@@ -226,6 +190,7 @@ void CACHE::handle_fill()
                 assert(0);	//What else could there be? No other case, right? 
 
         }
+
 
 
         // is this dirty?
@@ -259,7 +224,11 @@ void CACHE::handle_fill()
                     writeback_packet.event_cycle = current_core_cycle[fill_cpu];
 
                     lower_level->add_wq(&writeback_packet);
-                }
+
+                    block[set][way].valid = 0; // current line become invalid
+                    block[set][way].dirty = 0; // current line is no longer dirty, as dirty line is moved to the lower cache
+                    // block[set][way].tag = 0;
+                }   
             }
 #ifdef SANITY_CHECK
             else {
@@ -270,69 +239,50 @@ void CACHE::handle_fill()
 #endif
         }
 
-        // 
         if (do_fill){
 
             //@Vasudha: For PC-offset DTLB prefetcher, in case of eviction, transfer block from training table to trained table
-
-            // Block is valid
             if(cache_type == IS_DTLB && block[set][way].valid==1)
             {
-                // Prefetcher learn which address translations are being used and which are being evicted, improving future TLB prefetches
-
                 dtlb_prefetcher_cache_fill(MSHR.entry[mshr_index].full_addr, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0, block[set][way].address<<LOG2_PAGE_SIZE, 
                         MSHR.entry[mshr_index].pf_metadata);
             }
             // update prefetcher
             if (cache_type == IS_L1I)
-
-                // The L1I prefetcher is updated with the instruction address that was filled, the set/way, and whether it was a prefetch. This helps the prefetcher learn instruction access patterns.
-
                 l1i_prefetcher_cache_fill(fill_cpu, ((MSHR.entry[mshr_index].ip)>>LOG2_BLOCK_SIZE)<<LOG2_BLOCK_SIZE, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0, ((block[set][way].ip)>>LOG2_BLOCK_SIZE)<<LOG2_BLOCK_SIZE);
             if (cache_type == IS_L1D)
             {
                 uint64_t v_fill_addr, v_evicted_addr;
-                
-                // PA to VA 
-                // L1D prefetcher is updated with the virtual address of the fill and the evicted block
                 map <uint64_t, uint64_t>::iterator ppage_check = inverse_table.find(MSHR.entry[mshr_index].full_addr >> LOG2_PAGE_SIZE);
-                
                 if(ppage_check == inverse_table.end())
                 {
-                    // If the evicted address isn't in the table, it's set to zero (not all evictions are of valid blocks).
-
                     cout << MSHR.entry[mshr_index];
                     assert(0);
                 }
-
-                // get the fill address
                 v_fill_addr = (ppage_check->second) << LOG2_PAGE_SIZE;
                 v_fill_addr |= (MSHR.entry[mshr_index].full_addr & ((1 << LOG2_PAGE_SIZE)-1));
 
                 //Now getting virtual address for the evicted address
                 /*Neelu: Note that it is not always necessary that evicted address is a valid address and is present in the inverse table, hence (1) do not use the assert and (2) if it is not present, assign it to zero. */
 
+
                 ppage_check = inverse_table.find(block[set][way].address >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE));
                 if(ppage_check != inverse_table.end())
                 {
-                    // evicted address 
                     v_evicted_addr = (ppage_check->second) << LOG2_PAGE_SIZE;
                     v_evicted_addr |= ((block[set][way].address << LOG2_BLOCK_SIZE) & ((1 << LOG2_PAGE_SIZE)-1));
                 }
                 else
                     v_evicted_addr = 0;
 
-                
                 l1d_prefetcher_cache_fill(v_fill_addr, MSHR.entry[mshr_index].full_addr, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0, v_evicted_addr, block[set][way].address<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].pf_metadata);
 
             }
             if  (cache_type == IS_L2C)
-                // L2 prefetchers are updated with the fill and eviction addresses
                 MSHR.entry[mshr_index].pf_metadata = l2c_prefetcher_cache_fill(MSHR.entry[mshr_index].address<<LOG2_BLOCK_SIZE, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0,
                         block[set][way].address<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].pf_metadata);
             if (cache_type == IS_LLC)
             {
-                // LLC prefetchers are updated with the fill and eviction addresses
                 cpu = fill_cpu;
                 MSHR.entry[mshr_index].pf_metadata = llc_prefetcher_cache_fill(MSHR.entry[mshr_index].address<<LOG2_BLOCK_SIZE, set, way, (MSHR.entry[mshr_index].type == PREFETCH) ? 1 : 0,
                         block[set][way].address<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].pf_metadata);
@@ -340,15 +290,12 @@ void CACHE::handle_fill()
             }
 
 
-            // cache's replacement policy (e.g., LRU or a custom policy) is updated with information about the fill and eviction
+            // update replacement policy
             (this->*update_replacement_state)(fill_cpu, set, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, block[set][way].full_addr, MSHR.entry[mshr_index].type, 0);
 
             // COLLECT STATS
-            // counter of mshr misses
             sim_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
-
             //Neelu: Capturing instruction stats for L2C
-            
             if((cache_type == IS_L2C) && (MSHR.entry[mshr_index].instruction == 1))
                 sim_instr_miss[fill_cpu][MSHR.entry[mshr_index].type]++;
             sim_access[fill_cpu][MSHR.entry[mshr_index].type]++;
@@ -370,79 +317,96 @@ void CACHE::handle_fill()
 #ifdef PUSH_DTLB_PB
             if ( (cache_type!=IS_DTLB) || (cache_type==IS_DTLB && MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION) )
 #endif	
-            
-        // Need to check the address is present in lower level, if yes, then invalidate it
-            TODO:
-            // if (cache_type == IS_L1D || cache_type == IS_L1I){
-            //     uint64_t L1_missed_address = MSHR.entry[mshr_index].address;
-            //     ooo_cpu[0].L2C.invalidate_entry(L1_missed_address);
+            // fill_cache(set, way, &MSHR.entry[mshr_index]);
+            if (cache_type == IS_L1D || cache_type == IS_L1I) {
+                uint64_t L1_missed_address = MSHR.entry[mshr_index].address;
                 
-            //     // ooo_cpu[0].L2C.MSHR.remove_queue(&ooo_cpu[0].L2C.MSHR.entry[mshr_index]);
-            //     // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
+                fill_cache(set, way, &MSHR.entry[mshr_index]);                       
+                
+                if (ooo_cpu[fill_cpu].L2C.check_hit(&MSHR.entry[mshr_index])) {
+                    ooo_cpu[fill_cpu].L2C.invalidate_entry(L1_missed_address);
+                }
+                // ooo_cpu[0].L2C.MSHR.remove_queue(&ooo_cpu[0].L2C.MSHR.entry[mshr_index]);
+                // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
+                
+                if (uncore.LLC.check_hit(&MSHR.entry[mshr_index])) {
+                    uncore.LLC.invalidate_entry(L1_missed_address);
+                }
+                
+            }      
+            
+            else if (cache_type == IS_L2C) {
+                uint64_t L2_missed_address = MSHR.entry[mshr_index].address;
 
-            //     uncore.LLC.invalidate_entry(L1_missed_address);
+                if (MSHR.entry[mshr_index].fill_level == FILL_L2) {
+                    
+                    if (ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index])) {
+                        ooo_cpu[fill_cpu].L1I.invalidate_entry(L2_missed_address);
+                    }
 
-            //     fill_cache(set, way, &MSHR.entry[mshr_index]);                       
-            // }
+                    if (ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index])) {
+                        ooo_cpu[fill_cpu].L1D.invalidate_entry(L2_missed_address);
+                    }
+                    
+                    fill_cache(set, way, &MSHR.entry[mshr_index]);                
+                }
 
-            // if (cache_type == IS_L2C) {
-            //     uint64_t L2_missed_address = MSHR.entry[mshr_index].address;
 
-            //     uncore.LLC.invalidate_entry(L2_missed_address);
-            //     // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
+                if (uncore.LLC.check_hit(&MSHR.entry[mshr_index])) {
+                    uncore.LLC.invalidate_entry(L2_missed_address);
+                }
 
-            //     if (MSHR.entry[mshr_index].fill_level == FILL_L2) {
-            //         fill_cache(set, way, &MSHR.entry[mshr_index]);
-            //     }
-            // }
+                // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
 
-            // if (cache_type == IS_LLC) {
-            //     // No need to check with DRAM
-            //     uint64_t LLC_missed_address = MSHR.entry[mshr_index].address;
+                // To make sure top level don't have that block
+                // if (ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index]) || ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index])) {
+                //     // assert(0);
+                // }
+            }
 
-            //     if (MSHR.entry[mshr_index].fill_level == FILL_L1 || MSHR.entry[mshr_index].fill_level == FILL_L2) {
-            //         // No need to fill_cache here, as the data will be filled in L1 or L2 cache
+            else if (cache_type == IS_LLC) {
+                // No need to check with DRAM
+                uint64_t LLC_missed_address = MSHR.entry[mshr_index].address;
 
-            //     } else {
-            //         fill_cache(set, way, &MSHR.entry[mshr_index]);
-            //     }
+                if (MSHR.entry[mshr_index].fill_level == FILL_L1 || MSHR.entry[mshr_index].fill_level == FILL_L2) {
+                // No need to fill_cache here, as the data will be filled in L1 or L2 cache
 
-            //     // No need to invalidate as the filled block will be there in LLC only.
-            // }
+                } else {
+                    fill_cache(set, way, &MSHR.entry[mshr_index]);
+                }
+
+            // No need to invalidate as the filled block will be there in LLC only.
+            }
+
+            else {
+                fill_cache(set, way, &MSHR.entry[mshr_index]);
+            }
 
 
 #ifdef PUSH_DTLB_PB
             else if (cache_type == IS_DTLB && MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION)
             {
-                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0);
                 uint32_t victim_way;
                 victim_way = ooo_cpu[fill_cpu].DTLB_PB.find_victim( fill_cpu, MSHR.entry[mshr_index].instr_id, 0, ooo_cpu[fill_cpu].DTLB_PB.block[0] , MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
+                ooo_cpu[fill_cpu].DTLB_PB.update_replacement_state(fill_cpu, 0, way, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].ip, ooo_cpu[fill_cpu].DTLB_PB.block[0][victim_way].full_addr, MSHR.entry[mshr_index].type, 0);
                 ooo_cpu[fill_cpu].DTLB_PB.fill_cache( 0, victim_way, &MSHR.entry[mshr_index] );
             }
 #endif
             // RFO marks cache line dirty
             if (cache_type == IS_L1D) {
-                // If the fill is a Read For Ownership (RFO) (typically a store miss), the filled cache line is marked dirty, since the CPU intends to write to it.
-
                 if (MSHR.entry[mshr_index].type == RFO)
                     block[set][way].dirty = 1;
             }
 
             //Neelu: Adding condition to ensure that STLB does not insert instruction translations to Processed queue.
-
-            // Either the request should notify both instruction and data TLBs, or it's a data (not instruction) request and associated with L1 prefetch queue entry
-
             if(cache_type == IS_STLB && MSHR.entry[mshr_index].l1_pq_index != -1 && (MSHR.entry[mshr_index].send_both_tlb or !MSHR.entry[mshr_index].instruction)) //@Vishal: Prefetech request from L1D prefetcher
             {
 
                 PACKET temp = MSHR.entry[mshr_index];
-                temp.data_pa = block[set][way].data; // physical address
+                temp.data_pa = block[set][way].data;
                 assert(temp.l1_rq_index == -1 && temp.l1_wq_index == -1);
                 temp.read_translation_merged = 0; //@Vishal: Remove this before adding to PQ
                 temp.write_translation_merged = 0;
-
-                // This queue is used to notify the L1D (or other upper-level caches) that the translation prefetch has completed and the result is available.
-
                 if (PROCESSED.occupancy < PROCESSED.SIZE)
                     PROCESSED.add_queue(&temp);
                 else
@@ -450,8 +414,6 @@ void CACHE::handle_fill()
             }
             else if(cache_type == IS_STLB && MSHR.entry[mshr_index].prefetch_translation_merged) //@Vishal: Prefetech request from L1D prefetcher
             {
-                // Prefetch translation request from the L1D prefetcher was merged with another translation request in the STLB. When the translation is ready (i.e., the page table walk is complete and the translation is filled into the STLB), the code prepares a notification packet and adds it to the PROCESSED queue.
-
                 PACKET temp = MSHR.entry[mshr_index];
                 temp.data_pa = block[set][way].data;
                 temp.read_translation_merged = 0; //@Vishal: Remove this before adding to PQ
@@ -463,10 +425,6 @@ void CACHE::handle_fill()
             }
 
             //Neelu: Invoking the L2C prefetcher on STLB fills
-
-// When a translation request completes in the shared TLB (STLB), and it originated from a data (not instruction) request in L1D (instruction == 0), the code sends a "hint" to the L2 cache prefetcher.
-
-// This hint is a physical address, constructed from the translation result and the original request's virtual address, and is marked with a special type (6) so the L2 prefetcher can differentiate it from regular prefetches.
 
 #ifdef STLB_HINT_TO_L2_PREF
             if(cache_type == IS_STLB)
@@ -480,8 +438,7 @@ void CACHE::handle_fill()
                             cout << "[" << NAME << "] " << __func__ << "sending stlb hint to L2: "; 
                             cout << " phy_addr: " << hex << phy_addr;
                             cout << " ip: " << MSHR.entry[mshr_index].ip << endl; });
-                    
-                    // send hint to L2 prefetcher
+
                     uint32_t temp_metadata = ooo_cpu[fill_cpu].L2C.l2c_prefetcher_operate(phy_addr<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].ip, 0, 6, 0);
                     float l2c_mpki; // = (ooo_cpu[fill_cpu].L2C.sim_access[fill_cpu][0]*1000)/(ooo_cpu[fill_cpu].num_retired);
                     if(warmup_complete[fill_cpu])
@@ -492,14 +449,14 @@ void CACHE::handle_fill()
                                 l2c_mpki = (ooo_cpu[fill_cpu].L2C.sim_miss[fill_cpu][0]*1000)/(ooo_cpu[fill_cpu].num_retired);
                     /*			if((((temp_metadata >> 17) & 1) | ((temp_metadata >> 18) & 1)) == 1)
                                 getting_hint_from_l2++;*/
-                    // send hint to LLC prefetcher
                     uncore.LLC.llc_prefetcher_operate(phy_addr<<LOG2_BLOCK_SIZE, MSHR.entry[mshr_index].ip, 0, 6, temp_metadata);
+
                 }
             }
 #endif
 
 
-//Neelu: Pushing Prefetches from L2 to L1 after they fill in L2.
+            //Neelu: Pushing Prefetches from L2 to L1 after they fill in L2.
 #ifdef PUSH_PREFETCHES_FROM_L2_TO_L1
             if((cache_type == IS_L2C) && (MSHR.entry[mshr_index].type == PREFETCH) && (MSHR.entry[mshr_index].fill_level == FILL_L2))
             {
@@ -507,22 +464,17 @@ void CACHE::handle_fill()
                 //uint32_t updated_metadata = MSHR.entry[mshr_index].pf_metadata | (1 << 16);	
                 //Neelu: Commenting this, because now, this bit will be set by the L2C prefetcher in the cache_fill function.
                 //Hence, argument passed will directly be MSHR packet's metadata instead of updated_metadata if the bit is set.
-                
-                // Pushes the prefetched line from L2 up to L1D.
                 if(((MSHR.entry[mshr_index].pf_metadata >> 16) & 1) == 1)
-                
                     ooo_cpu[fill_cpu].L1D.prefetch_line(MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].full_addr, FILL_L1, MSHR.entry[mshr_index].pf_metadata);
             }
 
 #endif	
 
             // check fill level
-            // Fill happening at lower level, if a request was sent from L1D to L2, and the fill is now happening in L2
             if (MSHR.entry[mshr_index].fill_level < fill_level) {
 
                 if(cache_type == IS_STLB)
                 {
-                    // If the fill is in the STLB, the code checks if the request should notify both the instruction and data TLBs (send_both_tlb), or just one 
                     MSHR.entry[mshr_index].prefetch_translation_merged = 0;
 
                     if(MSHR.entry[mshr_index].send_both_tlb)
@@ -536,46 +488,51 @@ void CACHE::handle_fill()
                         upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                 }
                 else if(cache_type == IS_L2C && (MSHR.entry[mshr_index].type == LOAD_TRANSLATION || MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION || MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D))
-                {   
-                    // Translation need to be copied
-
-                    // calls return_data() on an extra_interface (TLB) to deliver the translation result.
+                {
                     extra_interface->return_data(&MSHR.entry[mshr_index]);
-                }
 
+                }
                 else if(cache_type == IS_L2C)
                 {
-                    // For L2C
                     if(MSHR.entry[mshr_index].send_both_cache)
                     {
                         upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                         upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                        invalidate_entry(MSHR.entry[mshr_index].address); // Invalidate
                     }
                     else if(MSHR.entry[mshr_index].fill_l1i || MSHR.entry[mshr_index].fill_l1d)
                     {
-                        if(MSHR.entry[mshr_index].fill_l1i)
+                        if(MSHR.entry[mshr_index].fill_l1i) {
                             upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
-                        if(MSHR.entry[mshr_index].fill_l1d)
+                            invalidate_entry(MSHR.entry[mshr_index].address);
+                        }
+
+                        if(MSHR.entry[mshr_index].fill_l1d) {
                             upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+                            invalidate_entry(MSHR.entry[mshr_index].address);
+                        }
                     }
-                    else if (MSHR.entry[mshr_index].instruction)
+                    else if (MSHR.entry[mshr_index].instruction) {
                         upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
-                    else if (MSHR.entry[mshr_index].is_data)
-                        upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);				           
+                        invalidate_entry(MSHR.entry[mshr_index].address);
+                    }
+                    else if (MSHR.entry[mshr_index].is_data) {
+                        upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);				          
+                        invalidate_entry(MSHR.entry[mshr_index].address); 
+                    }
                 }
                 else
                 {
-                    // Other cases
                     if (MSHR.entry[mshr_index].instruction) 
                         upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                     else // data
                         upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
+
+                    invalidate_entry(MSHR.entry[mshr_index].address);     
                 }
             }
             //@v if send_both_tlb == 1 in STLB, response should return to both ITLB and DTLB
 
-            // Which completed requests should be added to the PROCESSED queue.
-            // fill is in ...
 
             // update processed packets
             if ((cache_type == IS_ITLB) && (MSHR.entry[mshr_index].type != PREFETCH_TRANSLATION)) { //@v Responses to prefetch requests should not go to PROCESSED queue 
@@ -606,10 +563,7 @@ void CACHE::handle_fill()
                 total_miss_latency += current_miss_latency;
             }
 
-            // completed request is removed from the MSHR
             MSHR.remove_queue(&MSHR.entry[mshr_index]);
-
-            // Number of requests serviced, decrement the count
             MSHR.num_returned--;
 
             update_fill_cycle();
@@ -617,22 +571,29 @@ void CACHE::handle_fill()
     }
 }
 
+
 void CACHE::handle_writeback()
 {
-
+    // No write requests pending, write queue is empty
     if(WQ.occupancy == 0)
         return;
 
+    // To store multiple values for same key
     multimap<uint64_t, uint32_t> writes_ready; //{cycle_time,index}
 
+// Only Cache allowed to generate write packets
 assert(cache_type != IS_L1I || cache_type != IS_STLB); //@Vishal: TLB should not generate write packets
 
 if(cache_type == IS_L1D) //Get completed index in WQ, as it is non-fifo
 {
+    // Iterate write back queue, stores pending write requests(store misses or writebacks for dirty)
     for (uint32_t wq_index=0; wq_index < WQ.SIZE; wq_index++)
+        // If write finished tranlation and completed to be processed further also prevents processing writes that are not yet due
         if(WQ.entry[wq_index].translated == COMPLETED && (WQ.entry[wq_index].event_cycle <= current_core_cycle[cpu])) 
             writes_ready.insert({WQ.entry[wq_index].event_cycle, wq_index});
 }
+
+// read/write iterator that points to the first pair in the multimap. Iteration is done in ascending order according to the keys i.e. cycle_time.
 auto writes_ready_it = writes_ready.begin();
 
 if(cache_type == IS_L1D && writes_ready.size() == 0)
@@ -641,59 +602,95 @@ if(cache_type == IS_L1D && writes_ready.size() == 0)
 if(cache_type == IS_L1D)
     WQ.head = writes_ready_it->second; //@Vishal: L1 WQ is non fifo, so head variable is set to next index to be read	
 
+    // To index in WQ that is ready to be processed
     // handle write
     uint32_t writeback_cpu = WQ.entry[WQ.head].cpu;
+
+// Typically, multi core system, indicates which CPU considered for write back. 
+// means either all done or no one done
 if (writeback_cpu == NUM_CPUS)
     return;
 
-
     // handle the oldest entry
     if ((WQ.entry[WQ.head].event_cycle <= current_core_cycle[writeback_cpu]) && (WQ.occupancy > 0)) {
-        int index = WQ.head;
+        int index = WQ.head; // pending write
 
-        // access cache
+        // access cache, set to be placed the write line
         uint32_t set = get_set(WQ.entry[index].address);
+        // Address in write queue is already present in the cache set, way is set to the matching way where hit occured
         int way = check_hit(&WQ.entry[index]);
+
+        // This condition will not occur in exclusive cache
 
         if (way >= 0) { // writeback hit (or RFO hit for L1D)
 
-            (this->*update_replacement_state)(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1);
+            (this->*update_replacement_state)(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1); // Updates the cache state
 
             // COLLECT STATS
             sim_hit[writeback_cpu][WQ.entry[index].type]++;
             sim_access[writeback_cpu][WQ.entry[index].type]++;
 
             // mark dirty
-            block[set][way].dirty = 1;
+            block[set][way].dirty = 1; // data in the line modified 
 
             if (cache_type == IS_ITLB)
                 WQ.entry[index].instruction_pa = block[set][way].data;
             else if (cache_type == IS_DTLB)
                 WQ.entry[index].data_pa = block[set][way].data;
 
+            // Copy the modified data to the WQ    
             WQ.entry[index].data = block[set][way].data;
 
             // check fill level
-            if (WQ.entry[index].fill_level < fill_level) {
+            if (WQ.entry[index].fill_level < fill_level) { // block moved up the hierarchy
                 if(fill_level == FILL_L2)
-                {
+                {   // If WQ's fill level (L1), current fill_level (L2)
                     if(WQ.entry[index].fill_l1i)
-                    {
+                    {  // Block is relevent to L1 I cache, return data to the upper level l1i
                         upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
+                        // block[set][way].valid = 0; 
+                        invalidate_entry(WQ.entry[index].address);
                     }
                     if(WQ.entry[index].fill_l1d)
-                    {
+                    {   // Same as above but for l1d
                         upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                        // block[set][way].valid = 0;
+                        invalidate_entry(WQ.entry[index].address);
                     }
+                    // data filled by L2 and is sent back to the L1
                 }
                 else
-                {
-                    if (WQ.entry[index].instruction)
-                        upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
-                    if (WQ.entry[index].is_data)
-                        upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
-                }
+                {  // If WQ's fill level (L2/LLC), current fill_level (LLC/MEMORY)
 
+                    if (fill_level == FILL_LLC) {
+                        if (WQ.entry[index].fill_level == 2 || WQ.entry[index].fill_level == 1) {
+                            if (WQ.entry[index].instruction) {
+
+                                upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                
+                                // block[set][way].valid = 0;
+                                invalidate_entry(WQ.entry[index].address);
+                            }
+                  
+                            if (WQ.entry[index].is_data) {
+
+                                upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                
+                                // block[set][way].valid = 0;
+                                invalidate_entry(WQ.entry[index].address);
+                            }
+                        }
+                    } else {
+                        // DRAM
+                        if (WQ.entry[index].instruction) {
+                            upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);                            
+                        }
+
+                        if (WQ.entry[index].is_data) {
+                            upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                        }
+                    }
+                }
             }
 
             HIT[WQ.entry[index].type]++;
@@ -702,8 +699,9 @@ if (writeback_cpu == NUM_CPUS)
             // remove this entry from WQ
             WQ.remove_queue(&WQ.entry[index]);
         }
-        else { // writeback miss (or RFO miss for L1D)
 
+        else { // writeback miss (or RFO miss for L1D)
+            // block not present in the cache
             DP ( if (warmup_complete[writeback_cpu]) {
                     cout << "[" << NAME << "] " << __func__ << " type: " << +WQ.entry[index].type << " miss";
                     cout << " instr_id: " << WQ.entry[index].instr_id << " address: " << hex << WQ.entry[index].address;
@@ -711,9 +709,11 @@ if (writeback_cpu == NUM_CPUS)
                     cout << " cycle: " << WQ.entry[index].event_cycle << endl; });
 
             if (cache_type == IS_L1D) { // RFO miss
-
+                // read for ownership miss (store/load needs to fetch a block not present in L1D.)
                 // check mshr
                 uint8_t miss_handled = 1;
+                
+                // If miss alloced in the MSHR 
                 int mshr_index = check_nonfifo_queue(&MSHR, &WQ.entry[index],false); //@Vishal: Updated from check_mshr
 
                 if(mshr_index == -2)
@@ -722,12 +722,14 @@ if (writeback_cpu == NUM_CPUS)
                     miss_handled = 0;
                 }
 
+                // -1 no entry in MSHR and space in MSHR
                 if ((mshr_index == -1) && (MSHR.occupancy < MSHR_SIZE)) { // this is a new miss
 
                     assert(WQ.entry[index].full_physical_address != 0);
+
                     PACKET new_packet = WQ.entry[index];
                     //@Vishal: Send physical address to lower level and track physical address in MSHR  
-                    new_packet.address = WQ.entry[index].full_physical_address >> LOG2_BLOCK_SIZE;
+                    new_packet.address = WQ.entry[index].full_physical_address >> LOG2_BLOCK_SIZE; // removes offset bits
                     new_packet.full_addr = WQ.entry[index].full_physical_address; 
 
 
@@ -736,6 +738,8 @@ if (writeback_cpu == NUM_CPUS)
 
                     // add it to the next level's read queue
                     //if (lower_level) // L1D always has a lower level cache
+                    
+                    // Forwards miss to the next level in memory hierarchy
                     lower_level->add_rq(&new_packet);
                 }
                 else {
@@ -746,11 +750,15 @@ if (writeback_cpu == NUM_CPUS)
                         STALL[WQ.entry[index].type]++;
                     }
                     else if (mshr_index != -1) { // already in-flight miss
-
-                        // update fill_level
+                        
+                        // update fill_level, existing entry in mshr
+                        // new request fill level lower than MSHR fill level
                         if (WQ.entry[index].fill_level < MSHR.entry[mshr_index].fill_level)
-                            MSHR.entry[mshr_index].fill_level = WQ.entry[index].fill_level;
+                            MSHR.entry[mshr_index].fill_level = WQ.entry[index].fill_level; // update mshr fill level
 
+                        // MSHR = These flags in the MSHR entry track whether the outstanding miss (already in-flight) needs to eventually fill the block into L1I
+
+                        // Set if the request needs the block to be filled into the L1
                         if((WQ.entry[index].fill_l1i) && (MSHR.entry[mshr_index].fill_l1i != 1))
                         {
                             MSHR.entry[mshr_index].fill_l1i = 1;
@@ -769,19 +777,20 @@ if (writeback_cpu == NUM_CPUS)
                             uint64_t prior_full_addr = MSHR.entry[mshr_index].full_addr;
                             uint64_t prior_full_physical_address = MSHR.entry[mshr_index].full_physical_address;
 
-
+                            // Demand requests take precedence over prefetches
                             MSHR.entry[mshr_index] = WQ.entry[index];
 
 
                             //@Vishal: L1 RQ has virtual address, but miss needs to track physical address, so prior addresses are kept
                             if(cache_type == IS_L1D)
                             {
+                                // Requests may use virtual addresses in the request queue, but the MSHR must track the physical address for correct memory access and coherence. This ensures the MSHR continues to track the correct block, even after being overwritten by a demand request.
                                 MSHR.entry[mshr_index].address = prior_address;
                                 MSHR.entry[mshr_index].full_addr = prior_full_addr;
                                 MSHR.entry[mshr_index].full_physical_address = prior_full_physical_address;
                             }
 
-                            // in case request is already returned, we should keep event_cycle and retunred variables
+                            // in case request is already returned, we should keep event_cycle and returned variables
                             MSHR.entry[mshr_index].returned = prior_returned;
                             MSHR.entry[mshr_index].event_cycle = prior_event_cycle;
                         }
@@ -806,7 +815,7 @@ if (writeback_cpu == NUM_CPUS)
                     MISS[WQ.entry[index].type]++;
                     ACCESS[WQ.entry[index].type]++;
 
-                    // remove this entry from WQ
+                    // remove this entry from WQ, after handling remove from the queue
                     WQ.remove_queue(&WQ.entry[index]);
                 }
 
@@ -816,7 +825,7 @@ if (writeback_cpu == NUM_CPUS)
                 uint32_t set = get_set(WQ.entry[index].address), way;
                 way = (this->*find_victim)(writeback_cpu, WQ.entry[index].instr_id, set, block[set], WQ.entry[index].ip, WQ.entry[index].full_addr, WQ.entry[index].type);
 
-                uint8_t  do_fill = 1;
+                uint8_t do_fill = 1;
 
                 // is this dirty?
                 if (block[set][way].dirty) {
@@ -849,15 +858,18 @@ if (writeback_cpu == NUM_CPUS)
                             writeback_packet.event_cycle = current_core_cycle[writeback_cpu];
 
                             lower_level->add_wq(&writeback_packet);
+
+                            block[set][way].valid = 0;
+                            block[set][way].dirty = 0;
                         }
                     }
-#ifdef SANITY_CHECK
+                    #ifdef SANITY_CHECK
                     else {
                         // sanity check
                         if (cache_type != IS_STLB)
                             assert(0);
                     }
-#endif
+                     #endif
                 }
 
                 if (do_fill) {
@@ -868,7 +880,7 @@ if (writeback_cpu == NUM_CPUS)
                     {
                         //Neelu: Sending virtual fill and evicted address to L1D prefetcher.
                         //l1d_prefetcher_cache_fill(WQ.entry[index].full_addr, set, way, 0, block[set][way].address<<LOG2_BLOCK_SIZE, WQ.entry[index].pf_metadata);
-
+                        
                         uint64_t v_fill_addr, v_evicted_addr;
                         //First, getting virtual address for the fill address 
                         auto ppage_check = inverse_table.find(WQ.entry[index].full_addr >> LOG2_PAGE_SIZE);
@@ -902,7 +914,6 @@ if (writeback_cpu == NUM_CPUS)
                         cpu = 0;
                     }
 
-
                     // update replacement policy
                     (this->*update_replacement_state)(writeback_cpu, set, way, WQ.entry[index].full_addr, WQ.entry[index].ip, block[set][way].full_addr, WQ.entry[index].type, 0);
 
@@ -910,30 +921,91 @@ if (writeback_cpu == NUM_CPUS)
                     sim_miss[writeback_cpu][WQ.entry[index].type]++;
                     sim_access[writeback_cpu][WQ.entry[index].type]++;
 
-                    fill_cache(set, way, &WQ.entry[index]);
+
+                    if(fill_level == FILL_L2) {
+                        // inserting a new block from writeback queue
+                        fill_cache(set, way, &WQ.entry[index]);
+
+                        if(uncore.LLC.check_hit(&WQ.entry[index])) {
+                            uncore.LLC.invalidate_entry(WQ.entry[index].address);
+                        }
+
+                    } else{
+                        fill_cache(set, way, &WQ.entry[index]);
+                    }
+
+                    
 
                     // mark dirty
                     block[set][way].dirty = 1; 
 
                     // check fill level
+
+                    // block is being filled at a higher cache level than mshr previously recorded
+                    // The block came from an upper-level cache (e.g., from L1 to L2), and now the data is being written down into this cache.
                     if (WQ.entry[index].fill_level < fill_level) {
                         if(fill_level == FILL_L2)
-                        {
+                        {  // L1 -> L2
                             if(WQ.entry[index].fill_l1i)
                             {
-                                upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                // No need to inform, as complete line is now in L2 cache
+
+                                // upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
+
+                                // invalidate_entry(WQ.entry[index].address);
+
+                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index]))
+                                    ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
+
+                                WQ.entry[index].fill_l1i = 0;
                             }
                             if(WQ.entry[index].fill_l1d)
                             {
-                                upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                // No need to inform, as complete link is now in L1 cache
+                                
+                                // upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+
+                                // invalidate_entry(WQ.entry[index].address);
+
+                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index]))
+                                    ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
+
+                                WQ.entry[index].fill_l1d = 0;
                             }
                         }
                         else
-                        {
-                            if (WQ.entry[index].instruction)
-                                upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
-                            if (WQ.entry[index].is_data)
-                                upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                        {   
+                            // LLC or Memory
+                            if (fill_level == FILL_LLC) {
+                                // if (WQ.entry[index].instruction)
+                                //     upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                // if (WQ.entry[index].is_data)
+                                //     upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                
+                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index])) {
+
+                                    ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
+                                }
+                                
+                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index])) {
+
+                                    ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
+                                }
+
+                                if (ooo_cpu[writeback_cpu].L2C.check_hit(&WQ.entry[index])) {
+
+                                    ooo_cpu[writeback_cpu].L2C.invalidate_entry(WQ.entry[index].address);
+                                }
+                                
+                            }
+
+                            //
+                            if (fill_level == FILL_DRAM) {
+                                if (WQ.entry[index].instruction)
+                                    upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
+                                if (WQ.entry[index].is_data)
+                                    upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
+                            }
                         }
 
                     }
@@ -1356,7 +1428,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
 
                     PACKET temp = RQ.entry[index];
 
-                    if (temp.l1_pq_index != -1) //@Vishal: Check if the current request is sent from L1D prefetcher //TODO: Add condition to not send instruction translation request
+                    if (temp.l1_pq_index != -1)
                     {
                         assert(RQ.entry[index].l1_rq_index == -1 && RQ.entry[index].l1_wq_index == -1);//@Vishal: these should not be set
 
@@ -1516,18 +1588,27 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         {
                             upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
                             upper_level_dcache[read_cpu]->return_data(&RQ.entry[index]);
+                            invalidate_entry(RQ.entry[index].address);
                         }
                         else if(RQ.entry[index].fill_l1i || RQ.entry[index].fill_l1d)
                         {
-                            if(RQ.entry[index].fill_l1i)
+                            if(RQ.entry[index].fill_l1i) {
                                 upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
-                            if(RQ.entry[index].fill_l1d)
+                                invalidate_entry(RQ.entry[index].address);
+                            }
+                            if(RQ.entry[index].fill_l1d) {
                                 upper_level_dcache[read_cpu]->return_data(&RQ.entry[index]);	
+                                invalidate_entry(RQ.entry[index].address);
+                            }
                         }
-                        else if (RQ.entry[index].instruction)
+                        else if (RQ.entry[index].instruction) {
                             upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
-                        else if (RQ.entry[index].is_data)
+                            invalidate_entry(RQ.entry[index].address);
+                        }
+                        else if (RQ.entry[index].is_data) {
                             upper_level_dcache[read_cpu]->return_data(&RQ.entry[index]);
+                            invalidate_entry(RQ.entry[index].address);
+                        }
                     }
                     else	
                     {
@@ -1535,11 +1616,13 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         {
                             RQ.entry[index].data = block[set][way].data;
                             upper_level_icache[read_cpu]->return_data(&RQ.entry[index]);
+                            invalidate_entry(RQ.entry[index].address);
                         }
                         else // data
                         {
                             RQ.entry[index].data = block[set][way].data;
                             upper_level_dcache[read_cpu]->return_data(&RQ.entry[index]);
+                            invalidate_entry(RQ.entry[index].address);
                         }
 #ifdef SANITY_CHECK
                         if(cache_type == IS_ITLB || cache_type == IS_DTLB)
@@ -1631,7 +1714,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                             }
                             else
                             {
-
                                 // add it to mshr (read miss)
                                 add_nonfifo_queue(&MSHR, &RQ.entry[index]); //@Vishal: Updated from add_mshr
 
@@ -2385,8 +2467,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         else {
                             if ((mshr_index == -1) && (MSHR.occupancy == MSHR_SIZE)) { // not enough MSHR resource
 
-                                // TODO: should we allow prefetching with lower fill level at this case?
-
                                 // cannot handle miss request until one of MSHRs is available
                                 miss_handled = 0;
                                 STALL[PQ.entry[index].type]++;
@@ -2632,7 +2712,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
             uint64_t packet_tag;
             if(cache_type == IS_L1I || cache_type == IS_L1D) //@Vishal: VIPT
             {
-                assert(packet->full_physical_address != 0);
+                // assert(packet->full_physical_address != 0);
                 packet_tag = packet->full_physical_address >> LOG2_BLOCK_SIZE;
             }
             else

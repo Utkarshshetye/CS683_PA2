@@ -649,13 +649,13 @@ if (writeback_cpu == NUM_CPUS)
                     {  // Block is relevent to L1 I cache, return data to the upper level l1i
                         upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
                         // block[set][way].valid = 0; 
-                        // invalidate_entry(WQ.entry[index].address);
+                        invalidate_entry(WQ.entry[index].address);
                     }
                     if(WQ.entry[index].fill_l1d)
                     {   // Same as above but for l1d
                         upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
                         // block[set][way].valid = 0;
-                        // invalidate_entry(WQ.entry[index].address);
+                        invalidate_entry(WQ.entry[index].address);
                     }
                     // data filled by L2 and is sent back to the L1
                 }
@@ -669,7 +669,7 @@ if (writeback_cpu == NUM_CPUS)
                                 upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 
                                 // block[set][way].valid = 0;
-                                // invalidate_entry(WQ.entry[index].address);
+                                invalidate_entry(WQ.entry[index].address);
                             }
                   
                             if (WQ.entry[index].is_data) {
@@ -677,7 +677,7 @@ if (writeback_cpu == NUM_CPUS)
                                 upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 
                                 // block[set][way].valid = 0;
-                                // invalidate_entry(WQ.entry[index].address);
+                                invalidate_entry(WQ.entry[index].address);
                             }
                         }
                     } else {
