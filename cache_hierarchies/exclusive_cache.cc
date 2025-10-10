@@ -188,7 +188,6 @@ void CACHE::handle_fill()
                 data_evicting_data++;
             else
                 assert(0);	//What else could there be? No other case, right? 
-
         }
 
 
@@ -323,16 +322,17 @@ void CACHE::handle_fill()
                 
                 fill_cache(set, way, &MSHR.entry[mshr_index]);                       
                 
-                if (ooo_cpu[fill_cpu].L2C.check_hit(&MSHR.entry[mshr_index])) {
+                if (ooo_cpu[fill_cpu].L2C.check_hit(&MSHR.entry[mshr_index])>=0) {
                     ooo_cpu[fill_cpu].L2C.invalidate_entry(L1_missed_address);
+                    // block[set][way].valid = 0;
                 }
-                // ooo_cpu[0].L2C.MSHR.remove_queue(&ooo_cpu[0].L2C.MSHR.entry[mshr_index]);
-                // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
-                
-                if (uncore.LLC.check_hit(&MSHR.entry[mshr_index])) {
+
+                if (uncore.LLC.check_hit(&MSHR.entry[mshr_index]) >=0) {
                     uncore.LLC.invalidate_entry(L1_missed_address);
-                }
-                
+                } 
+
+                assert(ooo_cpu[fill_cpu].L2C.check_hit(&MSHR.entry[mshr_index]) == -1);
+                assert(uncore.LLC.check_hit(&MSHR.entry[mshr_index]) == -1);
             }      
             
             else if (cache_type == IS_L2C) {
@@ -340,11 +340,11 @@ void CACHE::handle_fill()
 
                 if (MSHR.entry[mshr_index].fill_level == FILL_L2) {
                     
-                    if (ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index])) {
+                    if (ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index]) >=0) {
                         ooo_cpu[fill_cpu].L1I.invalidate_entry(L2_missed_address);
                     }
 
-                    if (ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index])) {
+                    if (ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index]) >=0) {
                         ooo_cpu[fill_cpu].L1D.invalidate_entry(L2_missed_address);
                     }
                     
@@ -352,10 +352,13 @@ void CACHE::handle_fill()
                 }
 
 
-                if (uncore.LLC.check_hit(&MSHR.entry[mshr_index])) {
+                if (uncore.LLC.check_hit(&MSHR.entry[mshr_index]) >=0) {
                     uncore.LLC.invalidate_entry(L2_missed_address);
                 }
 
+                assert(ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index]) == -1);
+                assert(ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index]) == -1);
+                assert(uncore.LLC.check_hit(&MSHR.entry[mshr_index]) == -1);
                 // uncore.LLC.MSHR.remove_queue(&uncore.LLC.MSHR.entry[mshr_index]);
 
                 // To make sure top level don't have that block
@@ -371,11 +374,32 @@ void CACHE::handle_fill()
                 if (MSHR.entry[mshr_index].fill_level == FILL_L1 || MSHR.entry[mshr_index].fill_level == FILL_L2) {
                 // No need to fill_cache here, as the data will be filled in L1 or L2 cache
                     //  upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
-                } else {
+                    assert(uncore.LLC.check_hit(&MSHR.entry[mshr_index]) == -1);
+                } 
+
+                else {
                     fill_cache(set, way, &MSHR.entry[mshr_index]);
+
+                    if (ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index]) >=0) {
+                        ooo_cpu[fill_cpu].L1I.invalidate_entry(LLC_missed_address);
+                    }
+
+                    if (ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index]) >=0) {
+                        ooo_cpu[fill_cpu].L1D.invalidate_entry(LLC_missed_address);
+                    }
+
+                    if (ooo_cpu[fill_cpu].L2C.check_hit(&MSHR.entry[mshr_index])>=0) {
+                        ooo_cpu[fill_cpu].L2C.invalidate_entry(LLC_missed_address);
+                        // block[set][way].valid = 0;
+                    }
+
                 }
 
-            // No need to invalidate as the filled block will be there in LLC only.
+                assert(ooo_cpu[fill_cpu].L1I.check_hit(&MSHR.entry[mshr_index]) == -1);
+                assert(ooo_cpu[fill_cpu].L1D.check_hit(&MSHR.entry[mshr_index]) == -1);
+                assert(ooo_cpu[fill_cpu].L2C.check_hit(&MSHR.entry[mshr_index]) == -1);
+                
+                // No need to invalidate as the filled block will be there in LLC only.
             }
 
             else {
@@ -490,7 +514,6 @@ void CACHE::handle_fill()
                 else if(cache_type == IS_L2C && (MSHR.entry[mshr_index].type == LOAD_TRANSLATION || MSHR.entry[mshr_index].type == PREFETCH_TRANSLATION || MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D))
                 {
                     extra_interface->return_data(&MSHR.entry[mshr_index]);
-
                 }
                 else if(cache_type == IS_L2C)
                 {
@@ -521,13 +544,15 @@ void CACHE::handle_fill()
                         invalidate_entry(MSHR.entry[mshr_index].address); 
                     }
                 }
+                
                 else
                 {
+                    
                     if (MSHR.entry[mshr_index].instruction) 
                         upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                     else // data
                         upper_level_dcache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
-
+                    
                     invalidate_entry(MSHR.entry[mshr_index].address);     
                 }
             }
@@ -619,9 +644,8 @@ if (writeback_cpu == NUM_CPUS)
         uint32_t set = get_set(WQ.entry[index].address);
         // Address in write queue is already present in the cache set, way is set to the matching way where hit occured
         int way = check_hit(&WQ.entry[index]);
-
-        // This condition will not occur in exclusive cache
-
+        if(cache_type==IS_L2C){assert(way==-1);}
+        
         if (way >= 0) { // writeback hit (or RFO hit for L1D)
 
             (this->*update_replacement_state)(writeback_cpu, set, way, block[set][way].full_addr, WQ.entry[index].ip, 0, WQ.entry[index].type, 1); // Updates the cache state
@@ -651,6 +675,7 @@ if (writeback_cpu == NUM_CPUS)
                         // block[set][way].valid = 0; 
                         invalidate_entry(WQ.entry[index].address);
                     }
+                    
                     if(WQ.entry[index].fill_l1d)
                     {   // Same as above but for l1d
                         upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
@@ -680,7 +705,11 @@ if (writeback_cpu == NUM_CPUS)
                                 invalidate_entry(WQ.entry[index].address);
                             }
                         }
-                    } else {
+
+                        assert(check_hit(&WQ.entry[index]) == -1);
+                    } 
+                    
+                    else {
                         // DRAM
                         if (WQ.entry[index].instruction) {
                             upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);                            
@@ -689,6 +718,8 @@ if (writeback_cpu == NUM_CPUS)
                         if (WQ.entry[index].is_data) {
                             upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
                         }
+
+                        invalidate_entry(WQ.entry[index].address);
                     }
                 }
             }
@@ -933,11 +964,12 @@ if (writeback_cpu == NUM_CPUS)
                         // inserting a new block from writeback queue
                         fill_cache(set, way, &WQ.entry[index]);
 
-                        if(uncore.LLC.check_hit(&WQ.entry[index])) {
+                        if(uncore.LLC.check_hit(&WQ.entry[index]) >= 0) {
                             uncore.LLC.invalidate_entry(WQ.entry[index].address);
                         }
+                    }
 
-                    } else{
+                    else{
                         fill_cache(set, way, &WQ.entry[index]);
                     }
 
@@ -961,8 +993,11 @@ if (writeback_cpu == NUM_CPUS)
 
                                 // invalidate_entry(WQ.entry[index].address);
 
-                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index]))
+                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index]) >= 0)
                                     ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
+
+                                if (uncore.LLC.check_hit(&WQ.entry[index]) >= 0)
+                                    uncore.LLC.invalidate_entry(WQ.entry[index].address);
 
                                 WQ.entry[index].fill_l1i = 0;
                             }
@@ -974,8 +1009,11 @@ if (writeback_cpu == NUM_CPUS)
 
                                 // invalidate_entry(WQ.entry[index].address);
 
-                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index]))
+                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index]) >=0)
                                     ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
+
+                                if (uncore.LLC.check_hit(&WQ.entry[index]) >= 0)
+                                    uncore.LLC.invalidate_entry(WQ.entry[index].address);
 
                                 WQ.entry[index].fill_l1d = 0;
                             }
@@ -989,25 +1027,24 @@ if (writeback_cpu == NUM_CPUS)
                                 // if (WQ.entry[index].is_data)
                                 //     upper_level_dcache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 
-                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index])) {
+                                if (ooo_cpu[writeback_cpu].L1D.check_hit(&WQ.entry[index]) >=0) {
 
                                     ooo_cpu[writeback_cpu].L1D.invalidate_entry(WQ.entry[index].address);
                                 }
                                 
-                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index])) {
+                                if (ooo_cpu[writeback_cpu].L1I.check_hit(&WQ.entry[index]) >=0) {
 
                                     ooo_cpu[writeback_cpu].L1I.invalidate_entry(WQ.entry[index].address);
                                 }
 
-                                if (ooo_cpu[writeback_cpu].L2C.check_hit(&WQ.entry[index])) {
+                                if (ooo_cpu[writeback_cpu].L2C.check_hit(&WQ.entry[index]) >=0) {
 
                                     ooo_cpu[writeback_cpu].L2C.invalidate_entry(WQ.entry[index].address);
                                 }
-                                
                             }
 
-                            //
                             if (fill_level == FILL_DRAM) {
+
                                 if (WQ.entry[index].instruction)
                                     upper_level_icache[writeback_cpu]->return_data(&WQ.entry[index]);
                                 if (WQ.entry[index].is_data)
@@ -1378,7 +1415,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
 
             if (way >= 0) { // read hit
 
-
                 if (cache_type == IS_ITLB) {
 
                     //RQ.entry[index].instruction_pa = (va_to_pa(read_cpu, RQ.entry[index].instr_id, RQ.entry[index].full_addr, RQ.entry[index].address))>>LOG2_PAGE_SIZE; //block[set][way].data;
@@ -1461,11 +1497,19 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
 
                 }
                 else if (cache_type == IS_L1I) {
+
+                    assert(ooo_cpu[read_cpu].L2C.check_hit(&RQ.entry[index]) == -1);
+                    assert(uncore.LLC.check_hit(&RQ.entry[index]) == -1);
+
                     if (PROCESSED.occupancy < PROCESSED.SIZE)
                         PROCESSED.add_queue(&RQ.entry[index]);
                 }
                 //else if (cache_type == IS_L1D) {
                 else if ((cache_type == IS_L1D) && (RQ.entry[index].type != PREFETCH)) {
+
+                    assert(ooo_cpu[read_cpu].L2C.check_hit(&RQ.entry[index]) == -1);
+                    assert(uncore.LLC.check_hit(&RQ.entry[index]) == -1);
+
                     if (PROCESSED.occupancy < PROCESSED.SIZE)
                         PROCESSED.add_queue(&RQ.entry[index]);
                 }
@@ -1489,8 +1533,6 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
 
                 }
 
-
-
                 // update prefetcher on load instruction
                 if (RQ.entry[index].type == LOAD) {
                     assert(cache_type != IS_ITLB || cache_type != IS_DTLB || cache_type != IS_STLB);
@@ -1503,6 +1545,9 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                     }
                     else if (cache_type == IS_LLC)
                     {
+                        assert(ooo_cpu[read_cpu].L1D.check_hit(&RQ.entry[index]) == -1);
+                        assert(ooo_cpu[read_cpu].L2C.check_hit(&RQ.entry[index]) == -1);
+                        
                         cpu = read_cpu;
                         llc_prefetcher_operate(block[set][way].address<<LOG2_BLOCK_SIZE, RQ.entry[index].ip, 1, RQ.entry[index].type, 0);
                         cpu = 0;
@@ -1616,6 +1661,8 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                             upper_level_dcache[read_cpu]->return_data(&RQ.entry[index]);
                             invalidate_entry(RQ.entry[index].address);
                         }
+
+                        assert(ooo_cpu[read_cpu].L2C.check_hit(&RQ.entry[index]) == -1);
                     }
                     else	
                     {
@@ -1635,7 +1682,8 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         if(cache_type == IS_ITLB || cache_type == IS_DTLB)
                             if(RQ.entry[index].data == 0)
                                 assert(0);
-#endif
+#endif                  
+                        assert(uncore.LLC.check_hit(&RQ.entry[index]) == -1);
                     }
                 }
 
@@ -1649,6 +1697,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                         pref_useful[cpu][block[set][way].pref_class]++;
 
                 }
+
                 block[set][way].used = 1;
 
                 HIT[RQ.entry[index].type]++;
