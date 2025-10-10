@@ -1,34 +1,42 @@
 #include "cache.h"
 
-#define TRACKER_COUNT 64  // Configurable: 32, 64, 128 for evaluation
+#define TRACKER_COUNT 32  // Configurable: 32, 64, 128 for evaluation
 #define MAX_OFFSETS 5      // Track up to 5 offsets per page
 #define IS_PREFETCH (1u << 0) // Metadata bit to mark prefetches (unsigned 1)
 #define OFFSET_SHIFT 1     // Shift for offset in metadata
 #define OFFSET_BITS 6      // 6 bits for offset (up to 64 cache lines in 4KB page)
 
+// How many recent prefetched offsets we remember per page tracker.
+// Tunable: larger values increase memory per-tracker but allow longer detection window.
+#define RECENT_PF_COUNT 16
+
 class PAGE_TRACKER {
 public:
     uint64_t page;         // Page signature (address >> LOG2_PAGE_SIZE)
-    uint32_t offsets[MAX_OFFSETS]; // Absolute offsets within page
-
-    uint32_t load_count[MAX_OFFSETS];
-    uint32_t wb_count[MAX_OFFSETS];
-
+    uint32_t offsets[MAX_OFFSETS]; // Absolute offsets within page (statistical tracking)
     uint32_t freqs[MAX_OFFSETS];   // Frequency of each offset
     uint32_t issued;       // Total prefetches issued for this page
     uint32_t useful;       // Total useful prefetches
     uint32_t lru;          // LRU counter for tracker replacement
+
+    // New: recent prefetch buffer (circular). Stores offsets recently prefetched to LLC/L2.
+    uint32_t recent_pf[RECENT_PF_COUNT];
+    uint8_t recent_valid[RECENT_PF_COUNT];
+    int recent_head;
 
     PAGE_TRACKER() {
         page = 0;
         issued = 0;
         useful = 0;
         lru = 0;
+        recent_head = 0;
         for (int i = 0; i < MAX_OFFSETS; i++) {
             offsets[i] = 0;
             freqs[i] = 0;
-            load_count[i] = 0;
-            wb_count[i] = 0;
+        }
+        for (int i = 0; i < RECENT_PF_COUNT; i++) {
+            recent_pf[i] = 0;
+            recent_valid[i] = 0;
         }
     }
 };
@@ -44,22 +52,33 @@ void CACHE::l2c_prefetcher_initialize()
         trackers[i].lru = i;
 }
 
+// Helper: record a recently issued prefetch offset for this tracker
+static inline void record_recent_pf(PAGE_TRACKER &t, uint32_t offset) {
+    int idx = t.recent_head % RECENT_PF_COUNT;
+    t.recent_pf[idx] = offset;
+    t.recent_valid[idx] = 1;
+    t.recent_head = (t.recent_head + 1) % RECENT_PF_COUNT;
+}
+
+// Helper: find and invalidate a recent prefetch entry; returns true if found
+static inline bool consume_recent_pf(PAGE_TRACKER &t, uint32_t offset) {
+    for (int i = 0; i < RECENT_PF_COUNT; i++) {
+        if (t.recent_valid[i] && t.recent_pf[i] == offset) {
+            t.recent_valid[i] = 0; // consume it so we don't double count
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in, uint8_t critical_ip_flag)
 {
     // Extract page and offset from address
-    // Page is the address shifted right by LOG2_PAGE_SIZE (e.g., 12 for 4KB pages)
-    // Offset is the cache line index within the page (address >> LOG2_BLOCK_SIZE, masked)
     uint64_t page = addr >> LOG2_PAGE_SIZE;
-    //make all bits 1 in block number which are not part of page number so we can get offset within the page when we do & operation
     uint32_t offset = (addr >> LOG2_BLOCK_SIZE) & ((1ULL << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) - 1);
     uint32_t metadata_out = metadata_in;
 
-    // Check if this is a hit on a prefetched line
-    // If metadata has IS_PREFETCH bit, increment useful count for the matching offset
-    //metadata_in format  <-----UNUSED BITS(31-7)----><---OFFSET BITS(6-1)---><---1 PREFETCH BIT(0)-->
-
-    bool access_type_wb = type == WRITEBACK ? true:false;
-
+    // First: if cache hit and metadata marks this as a prefetch, mark useful
     if (cache_hit && (metadata_in & IS_PREFETCH)) {
         uint32_t pf_offset = (metadata_in >> OFFSET_SHIFT) & ((1ULL << OFFSET_BITS) - 1);
         int index = -1;
@@ -74,18 +93,34 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
                     break;
                 }
             }
+            // Also try to consume recent_pf entry if present (defensive)
+            consume_recent_pf(trackers[index], pf_offset);
         }
         metadata_out &= ~IS_PREFETCH; // Clear prefetch bit
+        return metadata_out;
     }
 
-    // Find or allocate a tracker for this page
+    // SECOND (new): If metadata didn't indicate prefetch (cache might have cleared it),
+    // try matching the access offset against our recently issued prefetches for the page.
     int index = -1;
     for (index = 0; index < TRACKER_COUNT; index++) {
         if (trackers[index].page == page)
             break;
     }
 
-    // If no tracker found, allocate one by replacing the least recently used
+    if (index < TRACKER_COUNT) {
+        // If we have a tracker for this page, check recent issued prefetches
+        if (cache_hit) {
+            if (consume_recent_pf(trackers[index], offset)) {
+                // We issued this offset recently and now it hit: count useful.
+                trackers[index].useful++;
+                // No metadata to clear in this case (cache cleared it), but we handled usefulness.
+                return metadata_out;
+            }
+        }
+    }
+
+    // If we didn't find a tracker, allocate one by replacing LRU (same as before)
     if (index == TRACKER_COUNT) {
         for (index = 0; index < TRACKER_COUNT; index++) {
             if (trackers[index].lru == (TRACKER_COUNT - 1))
@@ -94,17 +129,18 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
         trackers[index].page = page;
         trackers[index].issued = 0;
         trackers[index].useful = 0;
+        trackers[index].recent_head = 0;
         for (int j = 0; j < MAX_OFFSETS; j++) {
             trackers[index].offsets[j] = 0;
             trackers[index].freqs[j] = 0;
-            trackers[index].load_count[j] = 0;
-            trackers[index].wb_count[j] = 0;
-            trackers[index].freqs[j] = 0;
+        }
+        for (int j = 0; j < RECENT_PF_COUNT; j++) {
+            trackers[index].recent_pf[j] = 0;
+            trackers[index].recent_valid[j] = 0;
         }
     }
 
     // Update offset frequency
-    // Check if the current offset is already tracked
     int off_index = -1;
     for (int j = 0; j < MAX_OFFSETS; j++) {
         if (trackers[index].offsets[j] == offset) {
@@ -129,22 +165,11 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
         if (off_index == -1)
             off_index = min_index;
         trackers[index].offsets[off_index] = offset;
-        trackers[index].load_count[off_index] = 0;
-        trackers[index].wb_count[off_index] = 0;
         trackers[index].freqs[off_index] = 0;
     }
-
-    // trackers[index].freqs[off_index]++;
-    trackers[index].freqs[off_index] ++; 
-
-    if (access_type_wb) {
-        trackers[index].wb_count[off_index]++;
-    } else {
-        trackers[index].load_count[off_index]++;
-    }
+    trackers[index].freqs[off_index]++;
 
     // Prefetch if offset is frequent
-    // Use the most frequent offset for prefetching to predict the next likely access
     if (trackers[index].freqs[off_index] >= 1) {
         int max_freq_index = 0;
         uint32_t max_freq = trackers[index].freqs[0];
@@ -156,12 +181,7 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
         }
         uint32_t pf_offset = trackers[index].offsets[max_freq_index];
 
-        uint32_t dmd = trackers[index].load_count[max_freq_index];
-        uint32_t wb = trackers[index].wb_count[max_freq_index];
-        float dmd_frac_over_wb = (float)dmd / ((float)dmd + (float)wb + 1e-6f);
-
         // Determine prefetch degree based on accuracy
-        // If confidence (useful/issued) is high, use max degree; otherwise, use 1
         int degree = 1;
         if(trackers[index].issued > 0){
           float accuracy= (float)trackers[index].useful / trackers[index].issued;
@@ -177,13 +197,9 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
           }
           else if(accuracy>=0.6){
             degree=2;
-          }         
+          }
+         
         }
-
-        if(dmd_frac_over_wb < 0.5f) {
-            degree = std::min(degree, 1);
-        }
-
         for (int i = 0; i < degree; i++) {
             // Predict next offsets by incrementing the most frequent offset
             uint64_t next_offset = pf_offset + (i + 1);
@@ -195,25 +211,20 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
             if ((pf_address >> LOG2_PAGE_SIZE) != page)
                 break;
 
-            float accuracy = (trackers[index].issued > 0) ? ((float)trackers[index].useful / (float)trackers[index].issued) : 0.0f;
-            
-            if (MSHR.occupancy < (MSHR.SIZE/2)) {
-                if (accuracy >= 0.6f) {
-                    fill_level = FILL_L2; 
-                }else {
-                    fill_level = FILL_LLC;
-                }
-            }
-
-            // Prefetch to L2 if MSHR occupancy is low, else LLC
-            // uint32_t fill_level = (MSHR.occupancy < (MSHR.SIZE/2)) ? FILL_L2 : FILL_LLC;
-            
-            else{
-                fill_level = FILL_LLC;
+            // Target LLC by default for exclusive hierarchy (avoid duplication)
+            uint32_t fill_level = FILL_LLC;
+            if (critical_ip_flag) {
+                // If IP marked critical, bring to L2 (optional aggressive path)
+                fill_level = FILL_L2;
             }
 
             uint32_t pf_metadata = IS_PREFETCH | ((next_offset & ((1ULL << OFFSET_BITS) - 1)) << OFFSET_SHIFT);
             prefetch_line(ip, addr, pf_address, fill_level, pf_metadata);
+
+            // Record recent prefetch in the tracker so we can detect usefulness even if
+            // the cache clears metadata when moving between levels.
+            record_recent_pf(trackers[index], (uint32_t)next_offset);
+
             trackers[index].issued++;
         }
     }
@@ -230,7 +241,13 @@ uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache
 
 uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t match, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
 {
-    // No action needed for cache fill
+    // We keep conservative behavior here:
+    // - If the fill is a demand fill (prefetch==0) but the metadata_in carries IS_PREFETCH,
+    //   clear the bit since demand fills shouldn't look like prefetches to the core.
+    // - Otherwise, leave metadata alone.
+    if (!prefetch && (metadata_in & IS_PREFETCH)) {
+        metadata_in &= ~IS_PREFETCH;
+    }
     return metadata_in;
 }
 
@@ -238,4 +255,12 @@ void CACHE::l2c_prefetcher_final_stats()
 {
     // Print final statistics for the prefetcher
     cout << "CPU " << cpu << " L2C Region-based offset prefetcher final stats" << endl;
+    // Optionally print detailed tracker stats
+    for (int i = 0; i < TRACKER_COUNT; i++) {
+        if (trackers[i].page != 0) {
+            cout << "Tracker[" << i << "] page=0x" << std::hex << trackers[i].page << std::dec
+                 << " issued=" << trackers[i].issued << " useful=" << trackers[i].useful << endl;
+        }
+    }
 }
+
