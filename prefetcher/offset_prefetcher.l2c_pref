@@ -1,6 +1,6 @@
 #include "cache.h"
 
-#define TRACKER_COUNT 1024  // Configurable: 32, 64, 128 for evaluation
+#define TRACKER_COUNT 32  // Configurable: 32, 64, 128 for evaluation
 #define MAX_OFFSETS 5      // Track up to 5 offsets per page
 #define IS_PREFETCH (1u << 0) // Metadata bit to mark prefetches (unsigned 1)
 #define OFFSET_SHIFT 1     // Shift for offset in metadata
