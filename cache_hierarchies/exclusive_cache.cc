@@ -370,7 +370,7 @@ void CACHE::handle_fill()
 
                 if (MSHR.entry[mshr_index].fill_level == FILL_L1 || MSHR.entry[mshr_index].fill_level == FILL_L2) {
                 // No need to fill_cache here, as the data will be filled in L1 or L2 cache
-
+                    //  upper_level_icache[fill_cpu]->return_data(&MSHR.entry[mshr_index]);
                 } else {
                     fill_cache(set, way, &MSHR.entry[mshr_index]);
                 }
@@ -903,9 +903,16 @@ if (writeback_cpu == NUM_CPUS)
                         l1d_prefetcher_cache_fill(v_fill_addr, WQ.entry[index].full_addr, set, way, 0, v_evicted_addr, block[set][way].address<<LOG2_BLOCK_SIZE, WQ.entry[index].pf_metadata);		      
 
                     }
-                    else if (cache_type == IS_L2C)
-                        WQ.entry[index].pf_metadata = l2c_prefetcher_cache_fill(WQ.entry[index].address<<LOG2_BLOCK_SIZE, set, way, 0,
-                                block[set][way].address<<LOG2_BLOCK_SIZE, WQ.entry[index].pf_metadata);
+                    else if (cache_type == IS_L2C) {
+
+
+                        if (WQ.entry[index].type == WRITEBACK) {
+
+                            l2c_prefetcher_operate(block[set][way].address<<LOG2_BLOCK_SIZE, WQ.entry[index].ip, 0, WRITEBACK, 0, WQ.entry[index].critical_ip_flag);
+                        }
+                        
+                        WQ.entry[index].pf_metadata = l2c_prefetcher_cache_fill(WQ.entry[index].address<<LOG2_BLOCK_SIZE, set, way, 0, block[set][way].address<<LOG2_BLOCK_SIZE, WQ.entry[index].pf_metadata);
+                    }
                     if (cache_type == IS_LLC)
                     {
                         cpu = writeback_cpu;
@@ -2039,9 +2046,7 @@ if((cache_type == IS_L1I || cache_type == IS_L1D) && reads_ready.size() == 0)
                                     MSHR.entry[mshr_index].l1_pq_index_depend_on_me.insert(RQ.entry[index].l1_pq_index);
                                 }
                             }
-
-
-
+                            
                             MSHR_MERGED[RQ.entry[index].type]++;
 
                             DP ( if (warmup_complete[read_cpu]){	// || RQ.entry[index].address) {
